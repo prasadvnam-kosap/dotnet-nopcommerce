@@ -3,8 +3,8 @@
 # Second .NET APPLICATION cell. Its own CI (dotnet.yml) runs on WINDOWS, so the tests run there — the
 # harness rule is the declared environment, and it is also the .NET hook's first Windows run (still owed
 # per nuget-support.md). SDK 10.0.x, `dotnet restore src`, build, `dotnet test --no-build src`.
-# Three jobs: the hook comes out of the released Scanner image on Linux; the tests run on Windows; the
-# released Scanner reads the Windows trace against a Linux restore of the same pin.
+# Two jobs: the hook comes out of the released Scanner image on Linux; the tests run on Windows, and the
+# trace plus that same Windows restore are uploaded for the fixed Scanner to read locally.
 name: LOADED capture — nopCommerce
 on:
   workflow_dispatch:
@@ -63,39 +63,30 @@ jobs:
           $t = (Select-String -Path traces\*.loads -Pattern 'testhost' -List -ErrorAction SilentlyContinue).Count
           Write-Host "$n process traces, $t from a test host"
           if ($t -lt 1) { Write-Host "::error::no traced test host"; exit 1 }
-      - uses: actions/upload-artifact@v4
+      # The resolved set comes from THIS restore: a Linux restore of the same pin fell back to the project
+      # files (DECLARED-ONLY) on the first run, 2026-09-26. The fixed Scanner reads these locally.
+      - name: Restore output, for the local scan
         if: always()
-        with:
-          name: traces-windows
-          path: traces/
-          retention-days: 30
-  scan:
-    needs: test
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
-      - run: dotnet restore src || true
-      - uses: actions/download-artifact@v4
-        with:
-          name: traces-windows
-          path: traces
-      - name: Scan with the released Scanner, reading the Windows trace
+        shell: pwsh
         run: |
-          mkdir -p sbom
-          docker run --rm -v "$PWD:/w" -w /w ghcr.io/depproof/depproof:v1 \
-            scan --discover --usage-from traces --fail-on none --output-dir sbom 2>&1 | tee scan.log || true
+          Get-ChildItem -Recurse -Path src -Filter project.assets.json | ForEach-Object {
+            $rel = Resolve-Path -Relative $_.FullName
+            $dst = Join-Path restore $rel
+            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+            Copy-Item $_.FullName $dst
+          }
+          Get-ChildItem -Recurse -Path src -Filter *.csproj | ForEach-Object {
+            $rel = Resolve-Path -Relative $_.FullName
+            $dst = Join-Path restore $rel
+            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+            Copy-Item $_.FullName $dst
+          }
+          (Get-ChildItem -Recurse restore -Filter project.assets.json).Count
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: loaded-nopcommerce
           path: |
             traces/
-            sbom/
-            scan.log
+            restore/
           retention-days: 30
