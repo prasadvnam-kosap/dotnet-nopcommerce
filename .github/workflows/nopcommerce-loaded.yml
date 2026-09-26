@@ -1,0 +1,101 @@
+# LOADED capture — dotnet-nopcommerce (PROVE plan, phase 0 → 1 gate, added 2026-09-26).
+#
+# Second .NET APPLICATION cell. Its own CI (dotnet.yml) runs on WINDOWS, so the tests run there — the
+# harness rule is the declared environment, and it is also the .NET hook's first Windows run (still owed
+# per nuget-support.md). SDK 10.0.x, `dotnet restore src`, build, `dotnet test --no-build src`.
+# Three jobs: the hook comes out of the released Scanner image on Linux; the tests run on Windows; the
+# released Scanner reads the Windows trace against a Linux restore of the same pin.
+name: LOADED capture — nopCommerce
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch to measure. Defaults to the corpus pin.
+        required: false
+        default: 'depproof-pinned'
+permissions:
+  contents: read
+jobs:
+  hook:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The product's startup hook, from the released Scanner image
+        run: |
+          mkdir -p hook
+          id=$(docker create ghcr.io/depproof/depproof:v1)
+          docker cp "$id:/app/recorders/dotnet/DepproofLoaded.dll" hook/
+          docker rm "$id" >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hook
+          path: hook/
+          retention-days: 1
+  test:
+    needs: hook
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          name: hook
+          path: hook
+      - run: dotnet restore src
+      - run: dotnet build --no-restore --configuration Release src
+      - name: Tests, traced
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force traces | Out-Null
+          $env:DOTNET_STARTUP_HOOKS = "$env:GITHUB_WORKSPACE\hook\DepproofLoaded.dll"
+          $env:DEPPROOF_LOADED_DIR = "$env:GITHUB_WORKSPACE\traces"
+          dotnet test --no-build --configuration Release --verbosity minimal src
+          if ($LASTEXITCODE -ne 0) { Write-Host "suite exited $LASTEXITCODE — a partial suite still yields a valid trace" }
+          exit 0
+      - name: Canary — the hook wrote from a test host
+        shell: pwsh
+        run: |
+          $n = (Get-ChildItem traces -Filter *.loads -ErrorAction SilentlyContinue).Count
+          $t = (Select-String -Path traces\*.loads -Pattern 'testhost' -List -ErrorAction SilentlyContinue).Count
+          Write-Host "$n process traces, $t from a test host"
+          if ($t -lt 1) { Write-Host "::error::no traced test host"; exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: traces-windows
+          path: traces/
+          retention-days: 30
+  scan:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore src || true
+      - uses: actions/download-artifact@v4
+        with:
+          name: traces-windows
+          path: traces
+      - name: Scan with the released Scanner, reading the Windows trace
+        run: |
+          mkdir -p sbom
+          docker run --rm -v "$PWD:/w" -w /w ghcr.io/depproof/depproof:v1 \
+            scan --discover --usage-from traces --fail-on none --output-dir sbom 2>&1 | tee scan.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loaded-nopcommerce
+          path: |
+            traces/
+            sbom/
+            scan.log
+          retention-days: 30
